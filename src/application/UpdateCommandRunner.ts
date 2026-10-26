@@ -133,6 +133,7 @@ const runUpdateProcess = async (
     ...(workingDirectory === undefined ? {} : { cwd: workingDirectory }),
   });
   let processFailure: string | undefined;
+  let outputBudgetExceeded = false;
   const { terminationGraceMs } = limits;
   let drainGraceTimer: NodeJS.Timeout | undefined;
   let killTimer: NodeJS.Timeout | undefined;
@@ -192,12 +193,12 @@ const runUpdateProcess = async (
       maxDiagnosticBytes: limits.maxOutputBytes,
       onDiagnostic: (event) => {
         if (event.type === "error") processFailure ??= event.message;
-        if (
-          retention === "complete" &&
-          event.type === "output" &&
-          event.truncated === true
-        )
-          scheduleTerminationAfterDrainGrace();
+        if (event.type === "output" && event.truncated === true) {
+          // `snapshot().diagnosticTruncated` also reports incomplete output, so record
+          // the byte-budget overflow itself, and only when no failure preceded it.
+          if (processFailure === undefined) outputBudgetExceeded = true;
+          if (retention === "complete") scheduleTerminationAfterDrainGrace();
+        }
       },
     },
   );
@@ -242,11 +243,12 @@ const runUpdateProcess = async (
     const snapshot = supervisor.snapshot();
     // An overflow can destroy streams and terminate the child after the drain grace window,
     // so the complete-output budget error takes precedence over the resulting teardown
-    // stream or process errors. Probe interruption keeps its own cleanup report.
+    // stream or process errors. A failure observed before any overflow keeps its own
+    // cause, and probe interruption keeps its own cleanup report.
     if (
       interrupted === undefined &&
       retention === "complete" &&
-      snapshot.diagnosticTruncated === true
+      outputBudgetExceeded
     )
       return err(
         `Update command output exceeded the ${String(limits.maxOutputBytes)}-byte complete-output retention budget; reply was not accepted.`,
