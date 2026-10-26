@@ -90,6 +90,8 @@ export const artifactComparisonResultSchema = z.object({
     contradiction: z.int().min(0).default(0),
   }),
   changes: z.array(artifactChangeSchema),
+  // Absent on legacy records; absence does not identify a contradicting side.
+  integrity_mismatch_evidence_ids: z.array(evidenceIdSchema).optional(),
   limitations: z.array(z.string()),
 });
 
@@ -214,6 +216,17 @@ export const compareArtifacts = (
     right_manifest_id: right.inventory.manifest.manifest_id,
     summary,
     changes,
+    integrity_mismatch_evidence_ids: [
+      ...new Set(
+        [left, right].flatMap((source) =>
+          source.inventory.occurrences.some(
+            (occurrence) => occurrence.hash_status === "mismatched",
+          )
+            ? source.evidence.map((record) => record.evidence_id)
+            : [],
+        ),
+      ),
+    ].sort(compareUnicodeCodePoints),
     limitations: [...new Set(limitations)].sort(compareUnicodeCodePoints),
   });
 };
@@ -311,17 +324,20 @@ const buildArtifactChangeBase = (input: ClassifyPathInput) => ({
   evidence_links: [...input.evidenceLinks],
 });
 
-const classifyPresence = (input: ClassifyPathInput): ArtifactChange | null => {
+const classifyPresence = (
+  input: ClassifyPathInput,
+  base: ReturnType<typeof buildArtifactChangeBase>,
+): ArtifactChange | null => {
   const covered = input.path === "." ? input.rootCovered : input.entriesCovered;
   if (input.leftOccurrence === undefined)
     return {
-      ...buildArtifactChangeBase(input),
+      ...base,
       classification: covered ? "added" : "unknown",
       dimensions: [covered ? "content" : "availability"],
     };
   if (input.rightOccurrence === undefined)
     return {
-      ...buildArtifactChangeBase(input),
+      ...base,
       classification: covered ? "removed" : "unknown",
       dimensions: [covered ? "content" : "availability"],
     };
@@ -359,11 +375,12 @@ const classifyAvailability = (
 };
 
 const classifyPath = (input: ClassifyPathInput): ArtifactChange | null => {
-  const presence = classifyPresence(input);
-  if (presence !== null) return presence;
   const base = buildArtifactChangeBase(input);
+  // A declared/observed mismatch is known even without an opposite occurrence.
   const integrity = classifyIntegrity(input, base);
   if (integrity !== null) return integrity;
+  const presence = classifyPresence(input, base);
+  if (presence !== null) return presence;
   const declaration = classifyPyInstallerDeclaration(input, base);
   if (declaration.handled) return declaration.change;
   const availability = classifyAvailability(input, base);

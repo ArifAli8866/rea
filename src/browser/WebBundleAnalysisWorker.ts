@@ -16,7 +16,10 @@ import {
   artifactFileCancellationCause,
   withArtifactFileHandle,
 } from "../artifacts/ArtifactFileOperation.js";
-import { readStableArtifact } from "../artifacts/readStableArtifact.js";
+import {
+  completedStableArtifact,
+  readStableArtifact,
+} from "../artifacts/readStableArtifact.js";
 import type { StableArtifactSnapshot } from "../artifacts/readStableArtifact.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import {
@@ -28,6 +31,7 @@ import {
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { jsonParts, bufferedJsonParts } from "../domain/jsonSerialization.js";
+import { safeParseUtf8Json } from "../domain/safeJson.js";
 import { javaScriptRuntime } from "../domain/runtimeVersion.js";
 import { err, ok, type Result } from "../domain/result.js";
 import type { IncludedScript } from "../domain/webBundleAnalyzerState.js";
@@ -105,21 +109,6 @@ type WebBundleObservedFailure =
 type WebBundleActiveJob = {
   readonly id: string;
   readonly resultBudgetBytes: number;
-};
-
-const stableSnapshotValue = (
-  value: unknown,
-): StableArtifactSnapshot | undefined => {
-  if (
-    value === null ||
-    typeof value !== "object" ||
-    !("bytes" in value) ||
-    !Buffer.isBuffer(value.bytes) ||
-    !("sha256" in value) ||
-    typeof value.sha256 !== "string"
-  )
-    return undefined;
-  return { bytes: value.bytes, sha256: value.sha256 };
 };
 
 export interface WebBundleScriptAnalysisFailure {
@@ -394,7 +383,7 @@ export class WebBundleAnalysisWorker {
       result = ok(facts);
     } catch (cause) {
       const completion = artifactFileCompletion(cause);
-      const snapshot = stableSnapshotValue(completion?.value);
+      const snapshot = completedStableArtifact(cause);
       if (snapshot !== undefined && resultDescriptor !== undefined) {
         try {
           completed = this.#validateCompletedResult(
@@ -799,9 +788,9 @@ export class WebBundleAnalysisWorker {
         OPERATION,
         "Web analyzer result differs from its descriptor",
       );
-    const facts = webBundleScriptAnalysisSchema.parse(
-      JSON.parse(stored.bytes.toString("utf8")),
-    );
+    const parsed = safeParseUtf8Json(stored.bytes);
+    if (!parsed.ok) throw parsed.cause;
+    const facts = webBundleScriptAnalysisSchema.parse(parsed.value);
     if (facts.status !== "analyzed" || facts.script_key !== script.script_key)
       throw new AnalysisOutputError(
         OPERATION,

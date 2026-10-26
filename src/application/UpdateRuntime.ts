@@ -2,9 +2,6 @@ import { realpath, stat } from "node:fs/promises";
 import { homeDirectoryFromEnvironment } from "../config/homeDirectory.js";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import spawn from "cross-spawn";
-import { ProviderProcessSupervisor } from "../process/ProviderProcess.js";
-import { UpdateCommandProgress } from "./UpdateCommandProgress.js";
 import { lt, valid } from "semver";
 
 import { PRODUCT_IDENTITY } from "../identity.js";
@@ -18,10 +15,9 @@ import {
   type ReleaseLookupFailure,
   type UpdateHost,
   type UpdateInstallation,
-  type UpdateOutput,
 } from "./Update.js";
 import { planIntegrationMaintenance } from "./UpdateMaintenance.js";
-import { withoutPackageRunnerIdentity } from "./ClientRegistrationIdentity.js";
+import { UpdateCommandRunner } from "./UpdateCommandRunner.js";
 
 /** npm filesystem queries used to identify the installation being updated. */
 export interface NpmInstallationHost {
@@ -35,205 +31,6 @@ export interface BunInstallationHost {
   canonicalPath(path: string): Promise<string>;
   isFile(path: string): Promise<boolean>;
 }
-
-/** Grace period before an uncooperative update subprocess is terminated and escalated to SIGKILL. */
-export const DEFAULT_UPDATE_TERMINATION_GRACE_MS = 1_000;
-
-/** Aggregate raw-byte retention policy for package-manager replies and diagnostics. */
-export const UPDATE_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
-
-/**
- * Complete metadata queries share launch and collection with diagnostic-only installs.
- * Oversized complete replies are drained up to `maxOutputBytes` (defaults to
- * `UPDATE_COMMAND_OUTPUT_BYTES`, 4 MiB) and given `terminationGraceMs` to exit cleanly
- * before terminating an uncooperative writer (`SIGTERM`, then `SIGKILL` after `terminationGraceMs`).
- */
-export const runUpdateCommand = (
-  command: readonly string[],
-  selectedEnvironment: Readonly<NodeJS.ProcessEnv>,
-  output: UpdateOutput = "structured",
-  workingDirectory: string | undefined = undefined,
-  maxOutputBytes: number = UPDATE_COMMAND_OUTPUT_BYTES,
-  terminationGraceMs: number = DEFAULT_UPDATE_TERMINATION_GRACE_MS,
-): Promise<Result<string, string>> =>
-  runUpdateProcess(
-    command,
-    selectedEnvironment,
-    output,
-    workingDirectory,
-    "complete",
-    maxOutputBytes,
-    terminationGraceMs,
-  );
-
-const runUpdateProcess = async (
-  command: readonly string[],
-  selectedEnvironment: Readonly<NodeJS.ProcessEnv>,
-  output: UpdateOutput,
-  workingDirectory: string | undefined,
-  retention: "complete" | "diagnostics",
-  maxOutputBytes: number = UPDATE_COMMAND_OUTPUT_BYTES,
-  terminationGraceMs: number = DEFAULT_UPDATE_TERMINATION_GRACE_MS,
-): Promise<Result<string, string>> => {
-  const [executable, ...args] = command;
-  if (executable === undefined) return err("No executable supplied.");
-  const environment = withoutPackageRunnerIdentity(selectedEnvironment);
-  const child = spawn(executable, args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    env: environment,
-    windowsHide: true,
-    ...(workingDirectory === undefined ? {} : { cwd: workingDirectory }),
-  });
-  let processFailure: string | undefined;
-  let drainGraceTimer: NodeJS.Timeout | undefined;
-  let killTimer: NodeJS.Timeout | undefined;
-
-  const clearTimers = (): void => {
-    if (drainGraceTimer !== undefined) {
-      clearTimeout(drainGraceTimer);
-      drainGraceTimer = undefined;
-    }
-    if (killTimer !== undefined) {
-      clearTimeout(killTimer);
-      killTimer = undefined;
-    }
-  };
-
-  const onExit = (): void => {
-    clearTimers();
-  };
-
-  const terminate = (): void => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    child.stdout?.destroy();
-    child.stderr?.destroy();
-    try {
-      child.kill("SIGTERM");
-    } catch {
-      // Subprocess may have already terminated.
-    }
-    if (child.exitCode === null && child.signalCode === null) {
-      if (terminationGraceMs <= 0) {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // Subprocess may have already terminated.
-        }
-      } else {
-        killTimer = setTimeout(() => {
-          if (child.exitCode === null && child.signalCode === null) {
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // Subprocess may have already terminated.
-            }
-          }
-        }, terminationGraceMs);
-        killTimer.unref?.();
-      }
-    }
-  };
-
-  const scheduleTerminationAfterDrainGrace = (): void => {
-    if (
-      drainGraceTimer !== undefined ||
-      killTimer !== undefined ||
-      child.exitCode !== null ||
-      child.signalCode !== null
-    )
-      return;
-    if (terminationGraceMs <= 0) {
-      terminate();
-      return;
-    }
-    drainGraceTimer = setTimeout(() => {
-      drainGraceTimer = undefined;
-      terminate();
-    }, terminationGraceMs);
-    drainGraceTimer.unref?.();
-  };
-
-  child.once("exit", onExit);
-
-  const supervisor = new ProviderProcessSupervisor(
-    { process: child, ownsProcessLifetime: true },
-    {
-      maxDiagnosticBytes: maxOutputBytes,
-      onDiagnostic: (event) => {
-        if (event.type === "error") processFailure ??= event.message;
-        if (
-          retention === "complete" &&
-          event.type === "output" &&
-          event.truncated === true
-        ) {
-          scheduleTerminationAfterDrainGrace();
-        }
-      },
-    },
-  );
-  const progress =
-    output === "human" ? new UpdateCommandProgress(process.stderr) : undefined;
-  if (progress !== undefined) {
-    for (const stream of [child.stdout, child.stderr])
-      if (stream !== null) progress.pipe(stream);
-  }
-  try {
-    // Drain oversized replies so finite writers and verbose installs finish normally;
-    // complete-output metadata queries terminate an uncooperative writer if it stays open past terminationGraceMs.
-    await supervisor.waitForOutputClose();
-    const progressFailure = await progress?.close();
-    const snapshot = supervisor.snapshot();
-    // An overflow can trigger stream destruction and child termination after the drain grace window,
-    // so the complete-output budget error takes precedence over subsequent teardown stream or process errors.
-    if (retention === "complete" && snapshot.diagnosticTruncated === true)
-      return err(
-        `Update command output exceeded the ${String(maxOutputBytes)}-byte complete-output retention budget; reply was not accepted.`,
-      );
-    if (processFailure !== undefined) return err(processFailure);
-    if (snapshot.outputIncomplete === true)
-      return err("Update command output did not close completely.");
-    if (snapshot.exitCode !== 0 || snapshot.signal !== null) {
-      const detail =
-        snapshot.stderr.text.trim() ||
-        snapshot.stdout.text.trim() ||
-        (typeof snapshot.signal === "string"
-          ? `Process terminated by ${snapshot.signal}.`
-          : typeof snapshot.exitCode === "number"
-            ? `Process exited with code ${snapshot.exitCode}.`
-            : "Update command failed without a recorded exit status.");
-      return err(
-        snapshot.diagnosticTruncated
-          ? `${detail}\n[Update diagnostics truncated at ${String(maxOutputBytes)} bytes; later output omitted.]`
-          : detail,
-      );
-    }
-    if (
-      retention === "complete" &&
-      (snapshot.stdout.invalidUtf8 || snapshot.stderr.invalidUtf8)
-    )
-      return err(
-        "Update command returned invalid UTF-8; complete output is unavailable.",
-      );
-    if (progressFailure !== undefined)
-      return err(`Update progress output failed: ${progressFailure.message}`);
-    return ok(retention === "diagnostics" ? "" : snapshot.stdout.text.trim());
-  } finally {
-    clearTimers();
-    child.removeListener("exit", onExit);
-    // Reached only after physical close; no child or inherited pipe remains pending.
-    supervisor.dispose();
-    await progress?.close();
-  }
-};
-
-const requireCommandOutput = async (
-  command: readonly string[],
-  environment: Readonly<NodeJS.ProcessEnv>,
-): Promise<string> => {
-  const result = await runUpdateCommand(command, environment);
-  if (!result.ok) throw new Error(result.error);
-  return result.value;
-};
 
 /** Resolve the global prefix only when it owns the running package. */
 export const detectNpmInstallation = async (
@@ -438,6 +235,12 @@ export const systemUpdateHost = (
   environment: Readonly<NodeJS.ProcessEnv> = process.env,
 ): UpdateHost => {
   const resources = new ArtifactResourceScope();
+  const commands = new UpdateCommandRunner();
+  const requireOutput = async (command: readonly string[]): Promise<string> => {
+    const result = await commands.runProbe(command, environment);
+    if (!result.ok) throw new Error(result.error);
+    return result.value;
+  };
   return {
     installation: async () =>
       (await detectBunInstallation(
@@ -447,15 +250,13 @@ export const systemUpdateHost = (
       )) ??
       detectNpmInstallation(packageRoot, {
         canonicalPath: realpath,
-        globalRoot: () =>
-          requireCommandOutput(["npm", "root", "--global"], environment),
-        globalPrefix: () =>
-          requireCommandOutput(["npm", "prefix", "--global"], environment),
+        globalRoot: () => requireOutput(["npm", "root", "--global"]),
+        globalPrefix: () => requireOutput(["npm", "prefix", "--global"]),
       }),
     latestVersion: async (installation) => {
       const context = packageManagerContext(installation, environment);
       if (installation?.manager === "bun") {
-        const version = await runUpdateCommand(
+        const version = await commands.runProbe(
           ["bun", "--version"],
           context.environment,
           "structured",
@@ -472,7 +273,7 @@ export const systemUpdateHost = (
           });
       }
       return npmReleaseLookup(
-        await runUpdateCommand(
+        await commands.runProbe(
           installation?.manager === "bun"
             ? BUN_LATEST_VERSION_COMMAND
             : npmLatestVersionCommand(installation),
@@ -484,17 +285,16 @@ export const systemUpdateHost = (
     },
     installVersion: async (installation, version, output) => {
       const context = packageManagerContext(installation, environment);
-      const result = await runUpdateProcess(
+      const result = await commands.runInstall(
         updateInstallCommand(installation, version),
         context.environment,
         output,
         context.workingDirectory,
-        "diagnostics",
       );
       return result.ok ? ok(undefined) : result;
     },
     installedVersion: (installation) =>
-      runUpdateCommand(
+      commands.runProbe(
         [
           process.execPath,
           join(installation.packageRoot, "scripts", "rea.mjs"),
@@ -507,16 +307,26 @@ export const systemUpdateHost = (
         home ?? homeDirectoryFromEnvironment(environment, process.platform),
         join(installation.packageRoot, "scripts", "rea.mjs"),
         environment,
-        (command) => runUpdateCommand(command, environment),
+        (command) => commands.runProbe(command, environment),
         resources,
       ),
     close: async () => {
-      try {
-        await resources.close();
-        return undefined;
-      } catch (cause: unknown) {
-        return `Update resource cleanup failed: ${cause instanceof Error ? cause.message : String(cause)}`;
-      }
+      const results = await Promise.allSettled([
+        commands.close(),
+        resources.close(),
+      ]);
+      const failures = results.flatMap((result) =>
+        result.status === "rejected"
+          ? [
+              result.reason instanceof Error
+                ? result.reason.message
+                : String(result.reason),
+            ]
+          : [],
+      );
+      return failures.length === 0
+        ? undefined
+        : `Update resource cleanup failed: ${failures.join("; ")}`;
     },
   };
 };

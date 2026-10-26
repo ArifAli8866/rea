@@ -94,7 +94,10 @@ export class DirectoryArtifactReader implements ArtifactReader {
   readonly #files = new Map<OwnedFileHandle, string>();
   readonly #fileCleanup = new WeakMap<OwnedFileHandle, AnalysisCleanupLease>();
 
-  constructor(root: string) {
+  constructor(
+    root: string,
+    private readonly unreadableDirectories: "fail" | "omit" = "fail",
+  ) {
     this.#rootPath = root;
   }
 
@@ -131,18 +134,36 @@ export class DirectoryArtifactReader implements ArtifactReader {
       await withDirectoryIoContext("inspect directory", directory, () =>
         assertContainedDirectory(root, directory, admittedRoot.identity),
       );
-      for await (const entry of this.#readDirectory(
-        directory,
-        pending,
-        signal,
-        options,
-        examine,
-        (rawHex) => {
-          unrepresentableNameCount += 1;
-          firstUnrepresentableNameHex ??= rawHex;
-        },
-      ))
-        yield entry;
+      try {
+        for await (const entry of this.#readDirectory(
+          directory,
+          pending,
+          signal,
+          options,
+          examine,
+          (rawHex) => {
+            unrepresentableNameCount += 1;
+            firstUnrepresentableNameHex ??= rawHex;
+          },
+        ))
+          yield entry;
+      } catch (cause: unknown) {
+        if (
+          this.unreadableDirectories !== "omit" ||
+          !(cause instanceof DirectoryArtifactEntryAccessDenied)
+        )
+          throw cause;
+        abortIfNeeded(signal);
+        options?.onOmission?.({
+          path: cause.entryPath,
+          kind: "directory-descendants",
+        });
+        options?.onCoverage?.({
+          status: "unknown",
+          limitations: [cause.message],
+        });
+        continue;
+      }
       await withDirectoryIoContext("inspect directory", directory, () =>
         assertContainedDirectory(root, directory, admittedRoot.identity),
       );
@@ -204,6 +225,14 @@ export class DirectoryArtifactReader implements ArtifactReader {
     const handle = new OwnedDirectoryHandle(
       await opendir(directory, { encoding: "buffer" as BufferEncoding }).catch(
         (cause: unknown) => {
+          const code = hostErrorCode(cause);
+          if (directory !== root && (code === "EACCES" || code === "EPERM"))
+            throw new DirectoryArtifactEntryAccessDenied(
+              code,
+              relative(root, directory).split(sep).join("/"),
+              directoryIoFailure("open directory", directory, cause).message,
+              { cause },
+            );
           throw directoryIoFailure(
             "open directory",
             directory,
@@ -375,8 +404,19 @@ export class DirectoryArtifactReader implements ArtifactReader {
           const [opened, named] = await Promise.all([
             file.stat({ bigint: true }),
             lstat(entry.adapterKey, { bigint: true }),
-          ]);
-          abortIfNeeded(signal);
+          ]).catch((validationCause: unknown) => {
+            if (outcome.kind !== "failed") throw validationCause;
+            throw new ArtifactReaderFailure(
+              "io",
+              `Directory inspection failed: ${failureMessage(outcome.cause)}; final source identity could not be validated: ${failureMessage(validationCause)}`,
+              {
+                cause: new AggregateError(
+                  [outcome.cause, validationCause],
+                  "Directory inspection and final source validation failed",
+                ),
+              },
+            );
+          });
           if (
             !opened.isFile() ||
             !named.isFile() ||
@@ -385,9 +425,11 @@ export class DirectoryArtifactReader implements ArtifactReader {
           )
             throw new ArtifactReaderFailure(
               "integrity",
-              `Directory entry changed during inspection: ${entry.path}`,
+              `Directory entry changed during inspection: ${entry.path}${outcome.kind === "failed" ? `; inspection failed: ${failureMessage(outcome.cause)}` : ""}`,
+              outcome.kind === "failed" ? { cause: outcome.cause } : {},
             );
           if (outcome.kind === "failed") throw outcome.cause;
+          abortIfNeeded(signal);
           return outcome.value;
         },
       );
