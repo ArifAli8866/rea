@@ -210,8 +210,8 @@ const runUpdateProcess = async (
   }
   let retained = false;
   try {
-    // Drain even an oversized reply. Verbosity must not interrupt a package install.
-    // Keep the existing launch/signal policy; this collector owns no process-tree authority.
+    // Drain oversized replies so verbose installs finish normally;
+    // complete-output probes terminate an uncooperative writer after a drain grace window.
     const completed = await supervisor.waitForOutputClose(
       undefined,
       probe?.signal,
