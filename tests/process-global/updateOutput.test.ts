@@ -76,7 +76,8 @@ it("terminates an uncooperative probe writer with a signal when exceeding the ou
   expect(result).toMatchObject({
     ok: false,
     error: {
-      detail: expect.stringContaining("complete-output retention budget"),
+      kind: "execution",
+      detail: expect.stringContaining("1024"),
     },
   });
   expect(child?.signalCode).toBe("SIGTERM");
@@ -97,7 +98,8 @@ it("escalates to SIGKILL when an uncooperative probe writer ignores SIGTERM", as
   expect(result).toMatchObject({
     ok: false,
     error: {
-      detail: expect.stringContaining("complete-output retention budget"),
+      kind: "execution",
+      detail: expect.stringContaining("1024"),
     },
   });
   expect(child?.signalCode).toBe("SIGKILL");

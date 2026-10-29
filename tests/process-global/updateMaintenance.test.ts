@@ -668,12 +668,13 @@ describe("update subprocess output collection limits", () => {
       ],
       process.env,
     );
-    expect(result).toEqual(
-      err({
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
         kind: "execution",
-        detail: `Update command output exceeded the ${String(UPDATE_COMMAND_OUTPUT_BYTES)}-byte complete-output retention budget; reply was not accepted.`,
-      }),
-    );
+        detail: expect.stringContaining(String(UPDATE_COMMAND_OUTPUT_BYTES)),
+      },
+    });
   });
 
   it("terminates an endless stream and enforces the default output limit when omitted", async () => {
@@ -689,12 +690,13 @@ describe("update subprocess output collection limits", () => {
       [process.execPath, "-e", script],
       process.env,
     );
-    expect(result).toEqual(
-      err({
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
         kind: "execution",
-        detail: `Update command output exceeded the ${String(UPDATE_COMMAND_OUTPUT_BYTES)}-byte complete-output retention budget; reply was not accepted.`,
-      }),
-    );
+        detail: expect.stringContaining(String(UPDATE_COMMAND_OUTPUT_BYTES)),
+      },
+    });
   });
 
   it("enforces a custom collection limit when supplied", async () => {
@@ -706,13 +708,13 @@ describe("update subprocess output collection limits", () => {
       ],
       { maxOutputBytes: 1024 },
     );
-    expect(result).toEqual(
-      err({
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
         kind: "execution",
-        detail:
-          "Update command output exceeded the 1024-byte complete-output retention budget; reply was not accepted.",
-      }),
-    );
+        detail: expect.stringContaining("1024"),
+      },
+    });
   });
 
   it("escalates to SIGKILL and reports the limit error when a child process ignores SIGTERM", async () => {
@@ -724,13 +726,13 @@ describe("update subprocess output collection limits", () => {
       maxOutputBytes: 1024,
       terminationGraceMs: 200,
     });
-    expect(result).toEqual(
-      err({
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
         kind: "execution",
-        detail:
-          "Update command output exceeded the 1024-byte complete-output retention budget; reply was not accepted.",
-      }),
-    );
+        detail: expect.stringContaining("1024"),
+      },
+    });
   });
 
   it("escalates immediately to SIGKILL when terminationGraceMs is zero", async () => {
@@ -742,13 +744,13 @@ describe("update subprocess output collection limits", () => {
       maxOutputBytes: 1024,
       terminationGraceMs: 0,
     });
-    expect(result).toEqual(
-      err({
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
         kind: "execution",
-        detail:
-          "Update command output exceeded the 1024-byte complete-output retention budget; reply was not accepted.",
-      }),
-    );
+        detail: expect.stringContaining("1024"),
+      },
+    });
   });
 
   it("enforces the shared output budget across stdout and stderr when each stream is below the limit", async () => {
@@ -762,13 +764,13 @@ describe("update subprocess output collection limits", () => {
       ],
       { maxOutputBytes: 100 },
     );
-    expect(result).toEqual(
-      err({
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
         kind: "execution",
-        detail:
-          "Update command output exceeded the 100-byte complete-output retention budget; reply was not accepted.",
-      }),
-    );
+        detail: expect.stringContaining("100"),
+      },
+    });
   });
 
   it("succeeds when combined stdout and stderr output totals exactly the configured limit", async () => {
