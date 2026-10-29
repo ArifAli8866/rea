@@ -1,3 +1,7 @@
+import {
+  artifactNameForClassification,
+  namedArtifactFormat,
+} from "../domain/artifactNameSelection.js";
 import { readFileHandleRange } from "../filesystem/readFileHandleRange.js";
 import { readPeCoffHeader } from "../domain/peCoffHeader.js";
 import {
@@ -71,6 +75,14 @@ import {
 } from "../domain/apple/appleArchiveFormat.js";
 import { hasDiskImageSignature } from "../domain/apple/diskImageFormat.js";
 import { hasGodotPckHeader } from "../domain/godotPckFormat.js";
+import { hasUImageMagic } from "../domain/uimageFormat.js";
+import { hasUnityFsHeader } from "../domain/unityfsFormat.js";
+import { detectHexRecordEncoding } from "../domain/firmware/hexRecords.js";
+import { hasFitImagesNode } from "../domain/firmware/fitImage.js";
+import {
+  ESP8266_REFUSAL,
+  recognizeEspImage,
+} from "../domain/firmware/espImage.js";
 import {
   hasZipSignature,
   locateTrailingZipArchive,
@@ -166,7 +178,7 @@ export const parseBinaryTarget = async (
         try {
           return await readOpenedBinaryTarget(
             source,
-            { path, sourcePath, ...bundle },
+            { path, sourcePath, selectedPath: candidate, ...bundle },
             options,
           );
         } catch (cause: unknown) {
@@ -245,12 +257,13 @@ const readOpenedBinaryTarget = async (
   selected: {
     readonly path: string;
     readonly sourcePath: string;
+    readonly selectedPath: string;
     readonly bundleInfoPlist?: string;
   },
   options: BinaryTargetResolverOptions,
 ): Promise<TargetResolution> => {
   const { handle, initial: metadata } = source;
-  const { path, sourcePath, bundleInfoPlist } = selected;
+  const { path, sourcePath, selectedPath, bundleInfoPlist } = selected;
   const bundle = bundleInfoPlist === undefined ? {} : { bundleInfoPlist };
   const hostArchitecture = options.hostArchitecture ?? process.arch;
   const { targetKind, formatHint, signal, architecture, entryPoint } = options;
@@ -371,10 +384,11 @@ const readOpenedBinaryTarget = async (
   }
   // Probe WASM content before suffix-only database routing; an explicit
   // database selection keeps the caller's chosen interpretation.
+  const classificationPath = artifactNameForClassification(selectedPath, path);
   const artifactFormat =
     targetKind === "database"
       ? undefined
-      : await detectArtifactFormat(path, source, signal);
+      : await detectArtifactFormat(classificationPath, source, signal);
   if (
     targetKind === "database" ||
     (targetKind === undefined && path.toLowerCase().endsWith(".hop"))
@@ -390,6 +404,7 @@ const readOpenedBinaryTarget = async (
     const identity = {
       path,
       sourcePath,
+      artifactSelectedPath: selectedPath,
       sha256: await sha256Handle(handle, path, metadata, signal),
     };
     return isArchiveFormat(artifactFormat)
@@ -415,7 +430,8 @@ const readOpenedBinaryTarget = async (
         sourcePath,
         sha256: await sha256Handle(handle, path, metadata, signal),
         kind: "archive",
-        format: zipRootPackageFormat(path),
+        format: zipRootPackageFormat(classificationPath),
+        artifactSelectedPath: selectedPath,
       });
     const reason =
       typeof detected.error === "string"
@@ -657,10 +673,22 @@ const detectArtifactFormat = async (
     );
   if (hasZipSignature(magic)) return zipRootPackageFormat(lower);
   if (hasGodotPckHeader(magic)) return "godot-pck";
+  if (hasUnityFsHeader(magic)) return "unityfs";
+  if (hasUImageMagic(magic)) return "uimage";
+  const hexRecords = detectHexRecordEncoding(magic);
+  if (hexRecords !== undefined) return hexRecords;
+  const esp = recognizeEspImage(magic, initial.size);
+  if (esp === "esp8266")
+    throw new BinaryTargetError(path, ESP8266_REFUSAL, {
+      constraint: "file_format_rejected",
+    });
+  if (esp === "esp-image") return "esp-image";
+  if (hasFitImagesNode(magic)) return "fit";
   // Binary plists, including keyed archives, often use other extensions.
   if (hasBinaryPlistSignature(magic)) return "plist";
   const named = namedArtifactFormat(lower);
-  if (named !== undefined) return named;
+  if (named !== undefined && !claimsExecutableHeader(magic, initial.size))
+    return named;
   if (
     lower.endsWith(".pkg") &&
     magic.length >= 4 &&
@@ -708,15 +736,6 @@ const detectArtifactFormat = async (
   return undefined;
 };
 
-const namedArtifactFormat = (
-  lowerPath: string,
-): "asar" | "plist" | "source-map" | "javascript" | undefined => {
-  if (lowerPath.endsWith(".asar")) return "asar";
-  if (lowerPath.endsWith(".plist")) return "plist";
-  if (lowerPath.endsWith(".map")) return "source-map";
-  return /\.(?:m?js|cjs)$/u.test(lowerPath) ? "javascript" : undefined;
-};
-
 const isArchiveFormat = (
   format: Exclude<
     BinaryTarget["format"],
@@ -732,7 +751,18 @@ const isArchiveFormat = (
   >,
 ): format is Extract<BinaryTarget, { kind: "archive" }>["format"] =>
   isZipPackageFormat(format) ||
-  ["asar", "godot-pck", "dmg", "pkg"].includes(format);
+  [
+    "asar",
+    "godot-pck",
+    "unityfs",
+    "uimage",
+    "dmg",
+    "pkg",
+    "intel-hex",
+    "srec",
+    "esp-image",
+    "fit",
+  ].includes(format);
 
 /** Whether the leading bytes begin any executable header family, valid or not. */
 const claimsLeadingExecutableHeader = async (

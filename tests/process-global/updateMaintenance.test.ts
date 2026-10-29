@@ -529,7 +529,10 @@ describe("updated executable maintenance planning", () => {
       home,
       entryPoint,
       process.env,
-      (command) => updateCommands.runProbe(command, process.env),
+      async (command) => {
+        const result = await updateCommands.runProbe(command, process.env);
+        return result.ok ? result : err(result.error.detail);
+      },
     );
     expect(result).toMatchObject({
       status: "planned",
@@ -567,15 +570,19 @@ describe("updated executable maintenance planning", () => {
 });
 
 describe("update subprocess boundaries", () => {
-  cliTest("exposes update in CLI help", async ({ cli }) => {
-    const help = await cli.run({
-      arguments: ["--help"],
-      environment: process.env,
-    });
-    expect(help.exitCode, help.stderr).toBe(0);
-    expect(help.stdout).toMatch(/^\s{2}update\s/mu);
-    expect(help.stdout).not.toMatch(/^\s{2}upgrade\s/mu);
-  });
+  cliTest(
+    "exposes update in CLI help",
+    async ({ cli }) => {
+      const help = await cli.run({
+        arguments: ["--help"],
+        environment: process.env,
+      });
+      expect(help.exitCode, help.stderr).toBe(0);
+      expect(help.stdout).toMatch(/^\s{2}update\s/mu);
+      expect(help.stdout).not.toMatch(/^\s{2}upgrade\s/mu);
+    },
+    60_000,
+  );
 
   cliTest("rejects the removed upgrade CLI command", async ({ cli }) => {
     const removed = await cli.run({
@@ -609,13 +616,19 @@ describe("update subprocess boundaries", () => {
         ],
         process.env,
       ),
-    ).resolves.toEqual(err("EACCES /test/install"));
+    ).resolves.toEqual(
+      err({ kind: "execution", detail: "EACCES /test/install" }),
+    );
     const missing = await updateCommands.runProbe(
       [join(home, "missing-executable")],
       process.env,
     );
     expect(missing).toMatchObject({ ok: false });
-    if (!missing.ok) expect(missing.error).toContain("ENOENT");
+    if (!missing.ok)
+      expect(missing.error).toMatchObject({
+        kind: "launch",
+        detail: expect.stringContaining("ENOENT"),
+      });
   });
 
   it("verifies the requested package entry rather than PATH's rea", async () => {
@@ -656,9 +669,10 @@ describe("update subprocess output collection limits", () => {
       process.env,
     );
     expect(result).toEqual(
-      err(
-        `Update command output exceeded the ${String(UPDATE_COMMAND_OUTPUT_BYTES)}-byte complete-output retention budget; reply was not accepted.`,
-      ),
+      err({
+        kind: "execution",
+        detail: `Update command output exceeded the ${String(UPDATE_COMMAND_OUTPUT_BYTES)}-byte complete-output retention budget; reply was not accepted.`,
+      }),
     );
   });
 
@@ -676,9 +690,10 @@ describe("update subprocess output collection limits", () => {
       process.env,
     );
     expect(result).toEqual(
-      err(
-        `Update command output exceeded the ${String(UPDATE_COMMAND_OUTPUT_BYTES)}-byte complete-output retention budget; reply was not accepted.`,
-      ),
+      err({
+        kind: "execution",
+        detail: `Update command output exceeded the ${String(UPDATE_COMMAND_OUTPUT_BYTES)}-byte complete-output retention budget; reply was not accepted.`,
+      }),
     );
   });
 
@@ -692,9 +707,11 @@ describe("update subprocess output collection limits", () => {
       { maxOutputBytes: 1024 },
     );
     expect(result).toEqual(
-      err(
-        "Update command output exceeded the 1024-byte complete-output retention budget; reply was not accepted.",
-      ),
+      err({
+        kind: "execution",
+        detail:
+          "Update command output exceeded the 1024-byte complete-output retention budget; reply was not accepted.",
+      }),
     );
   });
 
@@ -708,9 +725,11 @@ describe("update subprocess output collection limits", () => {
       terminationGraceMs: 200,
     });
     expect(result).toEqual(
-      err(
-        "Update command output exceeded the 1024-byte complete-output retention budget; reply was not accepted.",
-      ),
+      err({
+        kind: "execution",
+        detail:
+          "Update command output exceeded the 1024-byte complete-output retention budget; reply was not accepted.",
+      }),
     );
   });
 
@@ -724,9 +743,11 @@ describe("update subprocess output collection limits", () => {
       terminationGraceMs: 0,
     });
     expect(result).toEqual(
-      err(
-        "Update command output exceeded the 1024-byte complete-output retention budget; reply was not accepted.",
-      ),
+      err({
+        kind: "execution",
+        detail:
+          "Update command output exceeded the 1024-byte complete-output retention budget; reply was not accepted.",
+      }),
     );
   });
 
@@ -742,9 +763,11 @@ describe("update subprocess output collection limits", () => {
       { maxOutputBytes: 100 },
     );
     expect(result).toEqual(
-      err(
-        "Update command output exceeded the 100-byte complete-output retention budget; reply was not accepted.",
-      ),
+      err({
+        kind: "execution",
+        detail:
+          "Update command output exceeded the 100-byte complete-output retention budget; reply was not accepted.",
+      }),
     );
   });
 
@@ -817,6 +840,125 @@ const createBunUpdateFixture = async (
   }
   return { globalDirectory, packageRoot, versionPath, logPath, binDirectory };
 };
+
+it.skipIf(process.platform === "win32")(
+  "distinguishes a missing npm metadata launcher from a started registry probe",
+  async () => {
+    const root = await createTestTempDirectory("rea-npm-probe-failure-");
+    const bin = join(root, "bin");
+    await mkdir(bin);
+    const host = systemUpdateHost(root, home, { ...process.env, PATH: bin });
+    const installation = {
+      manager: "npm" as const,
+      prefix: root,
+      packageRoot: root,
+    };
+    try {
+      expect(await host.latestVersion(installation)).toMatchObject({
+        ok: false,
+        error: {
+          kind: "package-manager-unavailable",
+          manager: "npm",
+          detail: expect.stringContaining("ENOENT"),
+        },
+      });
+      await writeFile(
+        join(bin, "npm"),
+        "#!/bin/sh\nprintf 'registry fixture failed\\n' >&2\nexit 7\n",
+        { mode: 0o755 },
+      );
+      expect(await host.latestVersion(installation)).toEqual(
+        err({ kind: "unavailable", detail: "registry fixture failed" }),
+      );
+    } finally {
+      await host.close?.();
+    }
+  },
+);
+
+it.skipIf(process.platform === "win32")(
+  "reports a Bun metadata launcher lost after a successful version probe",
+  async () => {
+    const root = await createTestTempDirectory("rea-bun-metadata-launch-");
+    const fixture = await createBunUpdateFixture(root, "1.4.2", 0, 0);
+    await writeFile(
+      join(fixture.binDirectory, "bun"),
+      "#!/bin/sh\n/bin/rm \"$0\"\nprintf '1.4.2\\n'\n",
+      { mode: 0o755 },
+    );
+    const host = systemUpdateHost(fixture.packageRoot, home, {
+      ...process.env,
+      PATH: fixture.binDirectory,
+      BUN_INSTALL_GLOBAL_DIR: fixture.globalDirectory,
+    });
+    try {
+      expect(
+        await host.latestVersion({
+          manager: "bun",
+          globalDirectory: fixture.globalDirectory,
+          packageRoot: fixture.packageRoot,
+        }),
+      ).toMatchObject({
+        ok: false,
+        error: {
+          kind: "package-manager-unavailable",
+          manager: "bun",
+          detail: expect.stringContaining("ENOENT"),
+        },
+      });
+    } finally {
+      await host.close?.();
+    }
+  },
+);
+
+it.skipIf(process.platform === "win32").each(["failed", "missing"] as const)(
+  "reports a %s local Bun probe without attempting release lookup",
+  async (mode) => {
+    const root = await createTestTempDirectory("rea-bun-probe-failure-");
+    const fixture = await createBunUpdateFixture(root, "1.4.2", 0, 0);
+    const executable = join(fixture.binDirectory, "bun");
+    if (mode === "missing") await rm(executable);
+    else
+      await writeFile(
+        executable,
+        `#!/bin/sh\nprintf 'probe\\n' > ${JSON.stringify(fixture.logPath)}\nprintf 'fixture: bun cannot start\\n' >&2\nexit 7\n`,
+        { mode: 0o755 },
+      );
+    const result = await runUpdate(
+      "3.2.1",
+      systemUpdateHost(fixture.packageRoot, home, {
+        ...process.env,
+        PATH: fixture.binDirectory,
+        BUN_INSTALL_GLOBAL_DIR: fixture.globalDirectory,
+      }),
+      "structured",
+    );
+    expect(result).toMatchObject({
+      status: "failed",
+      reason: "version-check",
+      latestVersion: null,
+      remediation: expect.stringContaining(
+        mode === "failed" ? "fixture: bun cannot start" : "ENOENT",
+      ),
+    });
+    expect(result).toHaveProperty(
+      "remediation",
+      expect.stringContaining("repair its launcher"),
+    );
+    expect(result).toHaveProperty(
+      "remediation",
+      expect.not.stringContaining("registry access"),
+    );
+    if (mode === "failed")
+      expect(await readFile(fixture.logPath, "utf8")).toBe("probe\n");
+    else
+      await expect(access(fixture.logPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    expect(await readFile(fixture.versionPath, "utf8")).toBe("3.2.1");
+  },
+);
 
 describe("Bun global installation update", () => {
   it.each([

@@ -1,28 +1,15 @@
 import { setImmediate } from "node:timers/promises";
-import { z } from "zod";
 
+import { asarNodeSchema } from "./AsarNode.js";
 import { ArtifactReaderFailure, type ArtifactEntry } from "./ArtifactReader.js";
 import { assertAsarReadActive } from "./AsarFailure.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 /** Capacity for expanded paths and listing records, independent of packed bytes. */
 const MAX_LISTING_BYTES = 64 * 1024 * 1024;
-const nodeSchema = z.looseObject({
-  files: z
-    .custom<Record<string, unknown>>(
-      (value) =>
-        value !== null && typeof value === "object" && !Array.isArray(value),
-    )
-    .optional(),
-  link: z.string().optional(),
-  size: z.number().nonnegative().safe().optional(),
-  offset: z.string().optional(),
-  unpacked: z.boolean().optional(),
-  executable: z.boolean().optional(),
-  integrity: z
-    .looseObject({ algorithm: z.string(), hash: z.string() })
-    .optional(),
-});
+const BLOCK_INTEGRITY_LIMITATION =
+  "ASAR block integrity declarations were not validated. Whole-file digest comparison does not establish block integrity or Electron runtime acceptance.";
+
 type AsarListedFacts = Pick<
   ArtifactEntry,
   "declaredIntegrity" | "executable" | "unpacked"
@@ -54,7 +41,7 @@ export const readAsarListing = async (
   header: unknown,
   signal?: AbortSignal,
 ): Promise<AsarListedEntry[]> => {
-  const root = nodeSchema.parse(header);
+  const root = asarNodeSchema.parse(header);
   if (root.files === undefined)
     throw new ArtifactReaderFailure("format", "ASAR root has no files table");
   const entries: AsarListedEntry[] = [];
@@ -102,7 +89,7 @@ export const readAsarListing = async (
     // occurrence even when the engine can share a string prefix.
     admitRetainedBytes(units * 2 + 256);
     const path = frame.parent.length === 0 ? name : `${frame.parent}/${name}`;
-    const metadata = nodeSchema.parse(raw);
+    const metadata = asarNodeSchema.parse(raw);
     if (
       metadata.files === undefined &&
       metadata.link === undefined &&
@@ -117,6 +104,16 @@ export const readAsarListing = async (
       declaration?.algorithm === "SHA256" &&
       /^[a-f0-9]{64}$/u.test(declaration.hash);
     const limitations: string[] = [];
+    if (
+      declaration !== undefined &&
+      (Object.hasOwn(declaration, "blockSize") ||
+        Object.hasOwn(declaration, "blocks"))
+    ) {
+      // Only declaration presence is observed. Do not interpret or copy an
+      // arbitrarily shaped block table, or imply its hashes were checked.
+      admitRetainedBytes(BLOCK_INTEGRITY_LIMITATION.length * 2 + 64);
+      limitations.push(BLOCK_INTEGRITY_LIMITATION);
+    }
     if (declaration !== undefined && !supportedIntegrity) {
       // JSON escaping can expand one source code unit to six characters.
       // Admit its UTF-16 storage and explanatory text before rendering it.
